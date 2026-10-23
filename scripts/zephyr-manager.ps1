@@ -5,6 +5,7 @@ param(
     [Parameter(Position = 1)][string]$InstallDir,
     [Parameter(Position = 0)][string]$BundlePath,
     [string]$Board, [string]$Qualifier, [string]$Toolchain, [string]$Revision,
+    [ValidateSet('Ite', 'Full')][string]$BundleProfile = 'Ite',
     [switch]$CacheOnly, [switch]$CheckOnly
 )
 
@@ -12,9 +13,21 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 function Get-DirectoryPath([string]$Path) {
+    # Keep logical paths canonical and prefix-free for containment checks and
+    # portable manifests. Extended paths suppress Win32 dot normalization.
+    if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) { $Path = '\\' + $Path.Substring(8) }
+    elseif ($Path.StartsWith('\\?\')) { $Path = $Path.Substring(4) }
     $full = [IO.Path]::GetFullPath($Path)
     if ($full -eq [IO.Path]::GetPathRoot($full)) { return $full }
     return $full.TrimEnd('\')
+}
+
+function Get-LongPath([string]$Path) {
+    # PS 5.1/.NET Framework enumeration needs the extended prefix even when
+    # the directory is <260 chars: appending a child or wildcard can exceed it.
+    $full = Get-DirectoryPath $Path
+    if ($full.StartsWith('\\')) { return '\\?\UNC\' + $full.Substring(2) }
+    return '\\?\' + $full
 }
 
 $PackageRoot = Get-DirectoryPath (Join-Path $PSScriptRoot '..')
@@ -44,8 +57,8 @@ function Invoke-Checked([string]$Exe, [string[]]$Arguments) {
 }
 
 function Assert-Within([string]$Path, [string]$Parent) {
-    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
-    $base = [IO.Path]::GetFullPath($Parent).TrimEnd('\')
+    $full = (Get-DirectoryPath $Path).TrimEnd('\')
+    $base = (Get-DirectoryPath $Parent).TrimEnd('\')
     if (-not $full.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase)) {
         throw "Path is outside the expected directory: $full"
     }
@@ -54,7 +67,7 @@ function Assert-Within([string]$Path, [string]$Parent) {
 
 function Get-RelativeBundlePath([string]$Path, [string]$Parent) {
     $checked = Assert-Within $Path $Parent
-    $prefix = [IO.Path]::GetFullPath($Parent).TrimEnd('\') + '\'
+    $prefix = (Get-DirectoryPath $Parent).TrimEnd('\') + '\'
     return $checked.Substring($prefix.Length)
 }
 
@@ -65,8 +78,9 @@ function Get-ToolsDirectory {
 }
 
 function Assert-NoLinks([string]$Path, [switch]$ShowProgress) {
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    $item = Get-Item -LiteralPath $Path -Force
+    $longPath = Get-LongPath $Path
+    if (-not (Test-Path -LiteralPath $longPath)) { return }
+    $item = Get-Item -LiteralPath $longPath -Force
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Linked path is not supported: $Path" }
     if (-not $item.PSIsContainer) { return }
     # Enumerate with .NET instead of invoking PowerShell cmdlets for every directory.
@@ -93,9 +107,10 @@ function Assert-NoLinks([string]$Path, [switch]$ShowProgress) {
 
 function Remove-Local([string]$Path, [string]$Parent) {
     $checked = Assert-Within $Path $Parent
-    if (Test-Path -LiteralPath $checked) {
+    $longPath = Get-LongPath $checked
+    if (Test-Path -LiteralPath $longPath) {
         Assert-NoLinks $checked
-        Remove-Item -LiteralPath $checked -Recurse -Force
+        Remove-Item -LiteralPath $longPath -Recurse -Force
     }
 }
 
@@ -375,26 +390,27 @@ function Read-CopyCancellation {
 }
 
 function Measure-CopySource([string]$Source, [string[]]$Excluded) {
-    if (-not (Test-Path -LiteralPath $Source -PathType Container)) { throw "Missing copy source directory: $Source" }
-    $stack = New-Object 'System.Collections.Generic.Stack[object]'
-    $stack.Push(@{ Directory = New-Object IO.DirectoryInfo($Source); Excluded = $false })
-    $excludedPaths = @($Excluded | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
+    $longSource = Get-LongPath $Source
+    if (-not (Test-Path -LiteralPath $longSource -PathType Container)) { throw "Missing copy source directory: $Source" }
+    $stack = New-Object 'System.Collections.Generic.Stack[IO.DirectoryInfo]'
+    $stack.Push((New-Object IO.DirectoryInfo($longSource)))
+    $excludedPaths = @($Excluded | ForEach-Object { (Get-LongPath $_).TrimEnd('\') })
     $bytes = [long]0
     $count = 0
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $nextUpdate = 0.0
     try {
         while ($stack.Count) {
-            $entry = $stack.Pop()
-            $directory = $entry.Directory
+            $directory = $stack.Pop()
             if ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Linked path is not supported: $($directory.FullName)" }
             foreach ($item in $directory.GetFileSystemInfos()) {
+                # Excluded directories are never copied. Do not descend into
+                # historical build trees or follow links inside omitted content.
+                if ($excludedPaths -contains $item.FullName.TrimEnd('\')) { continue }
                 if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Linked path is not supported: $($item.FullName)" }
                 if ($item -is [IO.DirectoryInfo]) {
-                    $skip = $entry.Excluded -or $excludedPaths -contains $item.FullName.TrimEnd('\')
-                    # Check excluded directories for links too, retaining the existing portability checks.
-                    $stack.Push(@{ Directory = $item; Excluded = $skip })
-                } elseif (-not $entry.Excluded) { $bytes += $item.Length; $count++ }
+                    $stack.Push($item)
+                } else { $bytes += $item.Length; $count++ }
             }
             if ($timer.Elapsed.TotalSeconds -ge $nextUpdate) {
                 Read-CopyCancellation
@@ -538,7 +554,7 @@ function Set-PackStage([int]$Step, [string]$Status) {
 function Get-BundleFileHashes([string]$Bundle) {
     Write-PackProgress -Activity 'Computing SHA-256' -Status 'Collecting bundle files'
     try {
-        $inventory = @(Get-ChildItem -LiteralPath $Bundle -Recurse -Force -File)
+        $inventory = @(Get-ChildItem -LiteralPath (Get-LongPath $Bundle) -Recurse -Force -File)
         $timer = [Diagnostics.Stopwatch]::StartNew()
         $nextUpdate = 0.0
         for ($i = 0; $i -lt $inventory.Count; $i++) {
@@ -832,10 +848,16 @@ function Copy-OfflineRequirements([string]$Path, [string]$Source, [string]$Desti
             $name, $extras, $url, $suffix = $Matches[1], $Matches[2], $Matches[3], $Matches[4]
             $origin = @($Frozen | Where-Object { $_ -match ('^' + [regex]::Escape($name) + '\s+@\s+') })
             $pin = @($Pinned | Where-Object { $_ -match ('^' + [regex]::Escape($name) + '==') })
-            if ($origin.Count -ne 1 -or $pin.Count -ne 1 -or ($origin[0] -replace '^.*?\s+@\s+', '' -replace '#.*$', '') -cne ($url -replace '#.*$', '')) {
+            $installedPin = @($Frozen | Where-Object { $_ -match ('^' + [regex]::Escape($name) + '==') })
+            $matchesOrigin = $origin.Count -eq 1 -and ($origin[0] -replace '^.*?\s+@\s+', '' -replace '#.*$', '') -ceq ($url -replace '#.*$', '')
+            # Index installations have no recorded archive origin. Reproduce the
+            # source freeze pin instead of claiming it came from the upstream URL.
+            $matchesPin = $origin.Count -eq 0 -and $installedPin.Count -eq 1 -and $pin.Count -eq 1 -and $installedPin[0] -ceq $pin[0]
+            if ($pin.Count -ne 1 -or (-not $matchesOrigin -and -not $matchesPin)) {
                 throw "Requirement URL does not match the installed source: $line"
             }
             if ($suffix -match '--hash|\\\s*$') { throw "Unsupported hash/continuation on remote requirement: $line" }
+            if ($matchesPin) { Write-Host "[PACK] Offline requirements use installed $($pin[0]); the source environment has no recorded URL origin." }
             $name + $extras + '==' + ($pin[0] -split '==', 2)[1] + $suffix
         } else { $line }
     })
@@ -897,9 +919,21 @@ function New-Bundle {
     Invoke-Checked $python @('-c', "import sys,struct; assert sys.version_info[:2] == (3,12) and struct.calcsize('P') == 8")
     Invoke-Checked $python @('-m', 'pip', 'check')
     Invoke-Checked $python @('-m', 'west', 'list')
-    # Check all active project paths; do not silently omit un-cloned modules.
+    # Verify every repository retained by the selected profile.
     $projectPaths = @(& $python -m west list -f '{abspath}')
     if ($LASTEXITCODE -ne 0) { throw 'Cannot list west project paths.' }
+    $itePlan = $null
+    if ($BundleProfile -eq 'Ite') {
+        if ($settings.Board -notmatch '^it(51|8)' -or $settings.Toolchain -ne 'riscv64-zephyr-elf') {
+            throw 'The Ite bundle profile requires an ITE RISC-V target. Use -BundleProfile Full for other platforms.'
+        }
+        $profileScript = Join-Path $PSScriptRoot 'ite-bundle.py'
+        $planJson = @(& $python $profileScript --source $source --toolchain $settings.Toolchain) -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot plan the ITE bundle profile.' }
+        $itePlan = $planJson | ConvertFrom-Json
+        $projectPaths = @($itePlan.ProjectPaths)
+        Write-Host ("[PACK] ITE platforms and {0} shared projects; other platform repositories are excluded." -f $itePlan.Projects.Count)
+    }
     foreach ($projectPath in $projectPaths) {
         $null = Assert-Within $projectPath $source
         $gitPath = Join-Path $projectPath '.git'
@@ -959,17 +993,46 @@ function New-Bundle {
         Set-PackStage 5 'Copy installers, workspace and SDK'
         Copy-Tree $Cache (Join-Path $bundle 'zephyr_installers')
         $targetWorkspace = Join-Path $bundle 'zephyrproject'
-        Copy-Tree $source $targetWorkspace @((Join-Path $source '.venv'), (Join-Path $source 'app\blinky\build'))
+        # Omit app as a whole so private applications and historical junction
+        # trees are neither scanned nor copied. Add only the sample below.
+        $excluded = @((Join-Path $source '.venv'), (Join-Path $source 'app'))
+        if ($itePlan) { $excluded += @($itePlan.ExcludedDirectories) }
+        Copy-Tree $source $targetWorkspace $excluded
+        $sample = Join-Path $source 'app\blinky'
+        if (Test-Path -LiteralPath $sample -PathType Container) {
+            if ((Get-Item -LiteralPath (Join-Path $source 'app') -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw 'Linked app directory is not supported.'
+            }
+            Write-Host '[PACK] Applications: blinky sample only; build output is excluded.'
+            Copy-Tree $sample (Join-Path $targetWorkspace 'app\blinky') @((Join-Path $sample 'build'))
+        }
+        if ($itePlan) {
+            $selectionPath = Join-Path $stage 'ite-selection.json'
+            Save-Json $itePlan $selectionPath
+            Invoke-Checked $python @($profileScript, '--source', $source, '--destination', $targetWorkspace, '--selection', $selectionPath)
+        }
         $sdkName = 'zephyr-sdk-' + (Get-Content -LiteralPath (Join-Path $sdk 'sdk_version') -Raw).Trim()
         if ($sdkName -notmatch '^zephyr-sdk-[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9_.-]*$') { throw 'Invalid SDK version.' }
         $targetSdk = Join-Path $targetWorkspace $sdkName
         if (Test-Path -LiteralPath $targetSdk) { Remove-Local $targetSdk $targetWorkspace }
-        Copy-Tree $sdk $targetSdk
+        $excludedSdk = @()
+        if ($itePlan) {
+            # SDK <=0.17 keeps toolchains at its root; SDK 1.x uses gnu/.
+            foreach ($sdkRoot in @($sdk, (Join-Path $sdk 'gnu'))) {
+                if (Test-Path -LiteralPath $sdkRoot) {
+                    $excludedSdk += @(Get-ChildItem -LiteralPath $sdkRoot -Directory |
+                        Where-Object { $_.Name -match '-zephyr-' -and $_.Name -ne $settings.Toolchain } |
+                        Select-Object -ExpandProperty FullName)
+                }
+            }
+        }
+        Copy-Tree $sdk $targetSdk $excludedSdk
+        $settings | Add-Member -NotePropertyName BundleProfile -NotePropertyValue $BundleProfile -Force
         $settings | Add-Member -NotePropertyName SdkDirectory -NotePropertyValue $sdkName -Force
         Save-Json $settings (Join-Path $targetWorkspace '.zephyr-setup.json')
         Set-PackStage 6 'Compute bundle checksums'
         $files = @(Get-BundleFileHashes $bundle)
-        Save-Json @{ Format = 1; Python = '3.12'; Architecture = 'x64'; Sdk = 'zephyrproject\' + $sdkName; Settings = $settings; HostTools = $hostEntries; Files = $files } (Join-Path $bundle 'bundle-manifest.json')
+        Save-Json @{ Format = 1; Python = '3.12'; Architecture = 'x64'; Profile = $BundleProfile; Sdk = 'zephyrproject\' + $sdkName; Settings = $settings; HostTools = $hostEntries; Files = $files } (Join-Path $bundle 'bundle-manifest.json')
         Push-Location -LiteralPath $bundle
         try {
             Set-PackStage 7 'Create 7z archive'
@@ -1015,8 +1078,9 @@ function Test-Bundle($Manifest) {
                 $nextUpdate = $timer.Elapsed.TotalSeconds + 1
             }
             $path = Assert-Within (Join-Path $Root $entry.Path) $Root
-            if (-not [IO.File]::Exists($path)) { throw "Missing bundle file: $($entry.Path)" }
-            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $entry.Sha256) { throw "Bundle file is damaged or modified: $($entry.Path)" }
+            $longPath = Get-LongPath $path
+            if (-not [IO.File]::Exists($longPath)) { throw "Missing bundle file: $($entry.Path)" }
+            if ((Get-FileHash -LiteralPath $longPath -Algorithm SHA256).Hash -ne $entry.Sha256) { throw "Bundle file is damaged or modified: $($entry.Path)" }
             $count++
         }
     } finally { Write-PackProgress -Completed }

@@ -2,6 +2,8 @@
 
 此專案提供 Windows 上的一鍵線上安裝、既有環境離線打包、離線安裝與確認後卸載。預設板卡為 `it51xxx_evb`，失敗時嘗試 `it51xxx_evb/it51526aw`，工具鏈為 `riscv64-zephyr-elf`。
 
+v0.1.6 支援選擇 ITE 精簡封裝或全部平台封裝；兩種模式的 `app` 都只攜帶 Blinky sample code 與設定檔，不含建置產物。另修正 Windows PowerShell 5.1 長路徑處理與離線 Python requirements 的版本驗證。
+
 所有 `.bat` 入口共用 `scripts/zephyr-manager.ps1`，必要步驟失敗時回傳 exit code 1；只有安裝及 Blinky 編譯都成功，才會顯示安裝完成。
 
 四個 `.bat` 結束時都會顯示總執行時間，例如 `[TIME] Total elapsed: 00:12:34 (754.32 seconds)`。計時包含目錄詢問、安裝、打包、解壓縮或編譯，成功、失敗與取消都會顯示；不包含最後 `pause` 等待按鍵的時間。使用單調計時器，跨午夜或執行期間調整系統時間不影響結果，超過 24 小時仍顯示累計小時。原有退出碼會保留。
@@ -29,7 +31,7 @@
 ## 一鍵線上安裝
 
 ```cmd
-git clone https://github.com/ITE-Richard/zephyr-easy-setup.git
+git clone https://github.com/richardjheng/zephyr-easy-setup.git
 cd zephyr-easy-setup
 zephyr-easy-setup.bat
 ```
@@ -169,14 +171,42 @@ zephyr-pack-offline.bat -InstallDir D:\ -SourceWorkspace D:\existing\zephyrproje
 
 `-SourceWorkspace` 指定要打包的來源，`-InstallDir` 指定快取、暫存目錄與輸出封裝的位置；兩者可不同。上例仍輸出到 `D:\zephyr-offline-bundle.7z`。
 
-來源必須包含完整 west 工作區（`.west`、Zephyr 與啟用的模組 Git 倉庫）、Python 3.12 x64 的 `.venv`，以及已解壓縮且包含目標 GCC 的 SDK。SDK 不在工作區內或有多個候選版本時，可用 `-SdkPath` 明確指定。來源沒有設定檔時使用 ITE 預設值；其他板卡請加上 `-Board`、`-Qualifier`、`-Toolchain`。
+### ITE 精簡封裝與後續更新
+
+打包預設使用 `-BundleProfile Ite`，保留全部 ITE 平台（it51xxx、it8xxx2、it82xx2）、RISC-V 與 Zephyr 共用核心。其他廠商的 board、SoC、架構與平台 DTS 不放進工作目錄；west 模組只保留明確列出的共用函式庫與 ITE HAL，SDK 只保留目前設定的 `riscv64-zephyr-elf` 工具鏈。篩選只修改打包暫存副本，不改動來源工作區。
+
+共用 drivers、devicetree bindings、shields 與必要的 Kconfig 設定檔仍保留。例如 ITE 板上可能使用 TI 充電 IC 或 ST 感測器，這些周邊支援不能只依廠商名稱刪除。這是 ITE **平台**封裝，沒有針對單一 app 裁切到最少檔案；共用函式庫清單位於 `scripts/ite-bundle.py` 的 `SHARED_PROJECTS`，新增未列入的外部模組前需檢查依賴並更新清單。
+
+封裝包含持續生效的設定：
+
+| 操作 | ITE 封裝安裝後的行為 |
+| --- | --- |
+| `git fetch` | 下載 Git 物件，不展開其他平台的工作目錄檔案 |
+| `git pull`／切換版本 | Zephyr 的 sparse checkout 規則繼續限制平台目錄，包括新加入的其他廠商目錄；衝突處理可能暫時展開檔案，處理後可執行 `git sparse-checkout reapply` |
+| `west update`（不帶專案名稱） | `.west/config` 的 `manifest.project-filter` 只啟用封裝所選模組，其他廠商 HAL 不會自動重新下載 |
+
+保留的 `.git` 歷史仍可能包含其他平台的物件，因此 sparse checkout **不會**把 Git 歷史中的其他廠商內容移除，也不保證減少後續 fetch 的下載量。要降低 Git 物件下載量需另外設計 partial clone；目前封裝保留既有 Git 歷史。手動關閉 sparse checkout、修改 west filter，或明確指定其他模組更新，都可能恢復其他平台資料。
+
+若要保留全部平台、模組與工具鏈（例如打包非 ITE 平台），請明確指定；`app` 同樣只打包 Blinky sample code：
+
+```cmd
+zephyr-pack-offline.bat -InstallDir D:\ -BundleProfile Full
+```
+
+### 打包驗證與內容
+
+來源必須包含 west 工作區（`.west`、Zephyr 與封裝 profile 要保留的模組 Git 倉庫）、Python 3.12 x64 的 `.venv`，以及已解壓縮且包含目標 GCC 的 SDK。SDK 不在工作區內或有多個候選版本時，可用 `-SdkPath` 明確指定。來源沒有設定檔時使用 ITE 預設值；其他板卡請加上 `-BundleProfile Full`、`-Board`、`-Qualifier`、`-Toolchain`。
+
+Windows PowerShell 5.1 下，工作區內超過 260 字元的深層路徑可進行掃描、複製、雜湊驗證、7z 封裝及解壓縮驗證，並可清除打包暫存；不需要修改系統長路徑登錄設定。封裝清單仍使用可攜的相對路徑。
+
+`Ite` 與 `Full` 模式的 `app` 都只打包來源 `app\blinky` 的 sample code 與設定檔，排除 `app\blinky\build`。其他 app、app 根目錄檔案及歷史建置／驗證資料皆不掃描、不複製，其中的 junction 也不會被跟隨。這只影響封裝內容，原始工作區完整保留，不需要額外的排除參數。來源沒有 `app\blinky` 時，離線安裝會沿用既有流程，從封裝內的 Zephyr Blinky sample 建立它。
 
 打包會：
 
 1. 讀取來源 `.venv` 的 `pip freeze --all`，固定目前實際套件版本並建立可直接安裝的 wheels。HTTP(S) 來源套件（例如 `reuse @ https://...`）會從原始 URL 建立 wheel，保留 URL 內的 hash 驗證；離線 requirements 改用已安裝版本，原始來源另存於 `requirements-source.txt`。只有原始碼的套件也會嘗試建立 wheel，可能需要額外的編譯工具。
 2. 重用 `zephyr_installers\tools\<package-id>` 中符合副檔名的安裝檔；缺少時透過 WinGet 下載 x64 EXE、MSI 或 ZIP。每項工具都明確指定 `--installer-type`：Python 為 `burn`、Git 為 `inno`、CMake 為 `wix`、7-Zip 為 `exe`，其餘 portable tools 為 `zip`，與離線安裝流程一致；既有不同格式的檔案可保留，但不會當成所需安裝檔使用。這些主機工具下載沒有指定 `--version`，不保證與來源電腦已安裝的工具版本相同；Python 套件則固定來源 `.venv` 的實際版本。
-3. 在乾淨的暫存 `.venv` 使用 `--no-index` 安裝全部固定版本、執行 `pip check`，並驗證 Zephyr / 模組 requirements。驗證使用暫存副本，將與已安裝來源相符的 HTTP(S) 套件引用改成固定版本，避免 pip 在驗證時存取 URL；原始 requirements 不會修改。
-4. 複製程式碼、`.west`、`.git`、SDK 與安裝檔到暫存目錄，不加入本專案的入口、共用腳本、README 或測試。只在副本排除來源 `.venv` 與 `app\blinky\build`，保留其他檔案與來源編譯結果。
+3. 在乾淨的暫存 `.venv` 使用 `--no-index` 安裝全部固定版本、執行 `pip check`，並驗證 Zephyr / 模組 requirements。驗證使用暫存副本，將 HTTP(S) 套件引用改成來源環境的固定版本，避免 pip 在驗證時存取 URL。來源安裝紀錄有 URL 時必須符合該網址；一般版本安裝沒有 URL 紀錄時，使用 `pip freeze` 與離線清單一致的版本，並顯示提示，不宣稱與上游網址同源。原始 requirements 不會修改。
+4. 依封裝 profile 複製程式碼、`.west`、`.git`、SDK 與安裝檔到暫存目錄，不加入本專案的入口、共用腳本、README 或測試。預設 ITE 模式排除其他 MCU 平台、HAL 與未使用的 SDK 工具鏈；`Full` 模式保留全部平台、模組與工具鏈。兩種模式皆排除來源 `.venv`，且 `app` 只複製 Blinky sample code 與設定檔，不含其 `build`。
 5. 建立逐檔 SHA-256 的 `bundle-manifest.json`，使用離線安裝檔內的 `7z.exe` 製作並測試 `zephyr-offline-bundle.7z`，確保打包與配套安裝檔使用同一版本。成功後在專案資料夾輸出 `7zip-x64.exe` 與 `7zip-x64.json`，清除已包含在封裝內的 `zephyr_installers`，以及舊版留下、版本相符的 `zephyr-offline-bootstrap`。
 
 打包採速度優先：7-Zip 使用 `a -t7z -mx=0`，以 Copy 模式直接將檔案存入 7z，不進行壓縮運算。7z 體積會接近所有打包檔案的總容量，但可省去壓縮與解壓縮運算；實際耗時仍取決於磁碟讀寫與檔案數量。來源驗證、暫存複製、逐檔 SHA-256 與 7z 完整性測試仍會執行。新設定只套用於重新啟動的打包流程，既有 ZIP 不會自動轉成 7z。
@@ -194,6 +224,8 @@ D:\
 ```
 
 打包會逐行顯示九個階段與百分比；階段比例不代表剩餘時間。掃描、複製、SHA-256 計算、壓縮及 7z 測試每十秒新增一行進度，階段開始與 7z 完成時立即顯示；不覆寫行首、不補滿整行空白，也不使用 PowerShell 浮動進度區塊。進度訊息依視窗寬度截短，使用原本底色，避免終端機折行、縮放或其他訊息輸出時互相覆蓋。掃描時顯示檔案數，複製時顯示已寫入容量、估計百分比與經過時間，SHA-256 計算顯示已完成檔案數。壓縮及 7z 測試擷取 7-Zip 百分比，只顯示進度條與經過時間，不顯示逐檔動作或檔名；警告、錯誤與失敗退出碼仍會回報。重新導向輸出採相同記錄頻率，不含游標控制字元。若系統無法提供複製程序的讀寫計數，仍會更新經過時間，百分比顯示為 `--%`。複製、壓縮與 7z 測試期間可按 Ctrl+C 中斷；腳本會結束此次啟動的外部程序並清理打包暫存目錄，大型暫存目錄的清理可能需要時間。已啟動的舊版流程不會套用腳本修改。
+
+解壓縮同樣顯示 7-Zip 的整數百分比。大量小檔案寫入較慢，百分比可能長時間不變；經過時間持續增加本身不能證明解壓縮有進展。可從工作管理員／資源監視器確認 7-Zip 的讀寫量、CPU 與目的地新增檔案是否持續變化；若仍在變化，可讓程序繼續執行。解壓縮完成後還要驗證 SHA-256、安裝工具與 Python 套件、設定 SDK 並編譯 Blinky，才算完成整個離線安裝。
 
 **已安裝的工具不等於仍保留安裝檔。** 若原電腦沒有 Python、Git 等離線安裝程式或缺少 wheels，首次打包需連網補齊。已有完整快取時，可讓 pip 下載使用 `--no-index`，並禁止下載缺少的主機工具安裝檔：
 
@@ -219,7 +251,7 @@ zephyr_installers/
   tools/oss-winget.dtc/*.zip
 ```
 
-wheel 無法取得或建立、SDK / 模組不完整、local / editable 或 VCS Python dependency、外部 Git objects、Git worktree 或 junction / symlink 都會中止打包，避免產生無法搬移的套件。`-CacheOnly` 只使用已建立的 wheels，不會存取套件的原始 URL。來源內含使用者 app 與 Git 歷史，請依實際需求分享封裝。
+wheel 無法取得或建立、SDK / 模組不完整、local / editable 或 VCS Python dependency、外部 Git objects、Git worktree 或保留內容中的 junction / symlink 都會中止打包，避免產生無法搬移的套件。`-CacheOnly` 只使用已建立的 wheels，不會存取套件的原始 URL。封裝內含 Blinky sample 的本地設定與保留倉庫的 Git 歷史，請依實際需求分享封裝。
 
 ### 打包後保留哪些目錄？
 
@@ -249,6 +281,14 @@ zephyr-offline-install.bat -BundlePath D:\zephyr-offline-bundle.7z -InstallDir D
 `-BundlePath` 指定 7z 或 ZIP 封裝路徑，`-InstallDir` 指定安裝根目錄；上例會解壓縮到 `D:\`，工作區位於 `D:\zephyrproject`。封裝路徑若包含空白，請加上引號。可加上 `-Board`、`-Qualifier`、`-Toolchain` 或 `-CheckOnly` 等選項；`-CheckOnly` 仍只檢查已解壓縮的離線包，不安裝工具或解壓縮。
 
 省略 `-BundlePath` 時會自動尋找封裝，例如 `zephyr-offline-install.bat -InstallDir D:\`。優先尋找 `.7z`，也支援舊的 `zephyr-offline-bundle.zip`。
+
+來源安裝位置與目標安裝位置可以不同。例如從 `D:\` 打包，再安裝到 `C:\`：
+
+```cmd
+zephyr-offline-install.bat -BundlePath D:\zephyr-offline-bundle.7z -InstallDir C:\
+```
+
+此時工作區位於 `C:\zephyrproject`；在新位置建立 `.venv`、從本地 wheels 安裝套件、重新註冊 Zephyr／SDK，再重新編譯 Blinky。SDK 設定使用相對於目標工作區的路徑，來源的 `.venv` 與 Blinky `build` 不會帶入，原本 `D:\` 的工作區仍保留。若封裝已搬到隨身碟，只要將 `-BundlePath` 改成實際位置即可。自訂的 `.vscode/settings.json`、腳本或其他設定若寫死來源磁碟路徑，仍需自行改成目標位置或專案相對路徑；安裝流程不會改寫這些使用者設定。
 
 流程依序為：
 
@@ -324,12 +364,15 @@ zephyr-easy-setup/
   zephyr-offline-install.bat  離線安裝
   zephyr-uninstall.bat        確認後卸載
   scripts/zephyr-manager.ps1  共用流程與錯誤檢查
+  scripts/ite-bundle.py       ITE 平台／模組篩選與 sparse checkout 設定
   tests/verify-workflows.ps1  隔離驗證
   tests/verify-launcher-timing.ps1  四個入口的執行時間與退出碼驗證
   tests/verify-offline-bootstrap.ps1  7-Zip 安裝順序與離線解壓縮驗證
   tests/verify-pack-archive.ps1   7z 整合驗證
   tests/verify-pack-cleanup.ps1   7z 發布、配套版本與暫存清理驗證
   tests/verify-pack-progress.ps1  打包進度與取消驗證
+  tests/verify-long-paths.ps1  Windows PowerShell 5.1 長路徑完整流程驗證
+  tests/verify-ite-bundle.py   ITE 篩選及 Git／west 後續更新驗證
   tests/verify-pack-terminal.ps1  終端機進度顯示驗證
   tests/verify-uninstall-tools.ps1  共用工具卸載回傳碼驗證
   zephyr_installers/          離線安裝快取（Git 忽略）
@@ -348,9 +391,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\verify-offline-boo
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\verify-pack-archive.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\verify-pack-cleanup.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\verify-pack-progress.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\verify-long-paths.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\verify-pack-terminal.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\verify-uninstall-tools.ps1
 ```
+
+ITE 平台篩選與後續更新測試使用已安裝 west 的 Python 環境，例如：
+
+```cmd
+D:\zephyrproject\.venv\Scripts\python.exe tests\verify-ite-bundle.py
+```
+
+測試以本機 Git 倉庫驗證平台／模組篩選、共用周邊保留、本地修改保留、fetch 後合併新版本仍排除其他廠商平台，以及 west update 只更新所選模組，不連網或修改原安裝。
 
 測試使用專案內的暫存資料，涵蓋取消卸載、保留 app、限制刪除範圍、拒絕 junction、保留隱藏 metadata、SHA-256 / 安裝檔檢查、各入口的 `-InstallDir` 與錯誤碼、磁碟根目錄選擇、中文 UTF-8 外部程式輸出，以及編譯失敗處理。編譯結果處理使用 native stub，未執行實際 Zephyr 編譯；測試不安裝／移除系統工具，也不寫入使用者登錄。
 
@@ -360,9 +412,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\verify-uninstall-t
 
 `verify-offline-bootstrap.ps1` 需要可執行的 7-Zip，會實際解壓縮小型 7z 與 ZIP；系統安裝以 stub 模擬。驗證本地安裝檔與封裝版本一致、7-Zip 安裝順序、bootstrap 雜湊、自動尋找、既有 app 保留及錯誤處理，不會真的安裝系統工具。
 
-`verify-pack-cleanup.ps1` 需要可執行的 7-Zip 與專案目錄中的 `7zip-x64.exe`。模擬 Python 驗證，實際使用安裝檔內的 7-Zip 製作小型 7z，並驗證成功、失敗與取消時清除暫存，保留已發布封裝和原有檔案。
+`verify-pack-cleanup.ps1` 需要可執行的 7-Zip 與專案目錄中的 `7zip-x64.exe`。模擬 Python 驗證，實際使用安裝檔內的 7-Zip 製作小型 7z，驗證 app 只包含 Blinky 原始碼與設定、不含其他 app／循環 junction／建置產物，並驗證成功、失敗與取消時清除暫存，保留已發布封裝和原有檔案。
 
 `verify-pack-progress.ps1` 驗證掃描與雜湊結果、複製進度、無法取得 I/O 計數時的顯示，以及取消後結束本次外部程序；可處理的打包取消會回傳 exit code 130。`verify-pack-terminal.ps1` 驗證完整換行、窄視窗截短、視窗縮放和一般訊息交錯時的排列、保留終端機顏色、立即顯示完成百分比，以及一般終端機與重新導向輸出的記錄頻率。
+
+`verify-long-paths.ps1` 需要已安裝 7-Zip，在超過 350 字元的測試路徑實際驗證掃描與排除、Robocopy、SHA-256、7z 封裝與解壓縮、損毀偵測、唯讀檔案清理，以及來源保留與路徑越界拒絕；也驗證明確排除含 junction 的 app 歷史目錄時，不複製該目錄且保留連結目標，未排除的連結仍會被拒絕。測試只操作專案內的暫存資料。
 
 完整驗收還需要：在線上機器完成安裝及編譯、產生 7z 封裝，再於沒有相關工具且斷網的 Windows x64 機器解壓縮安裝與編譯。隔離測試通過不代表上述完整驗收已完成。
 

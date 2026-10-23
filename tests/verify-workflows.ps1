@@ -137,6 +137,15 @@ try {
     Assert ((Get-Content -LiteralPath $includedRequirements) -eq $remoteLine) 'Original requirements were edited.'
     Set-Content -LiteralPath $includedRequirements -Value 'reuse @ https://example.invalid/different.tar.gz'
     Expect-Failure { Copy-OfflineRequirements $includedRequirements $Workspace (Join-Path $Root 'requirements-mismatch') $script:freezeFixture $pinned } '*does not match the installed source*'
+    # A normal index installation has a version pin, without direct_url metadata.
+    # Reproduce that installed snapshot even if upstream now requests an archive.
+    Set-Content -LiteralPath $includedRequirements -Value $remoteLine
+    $indexFrozen = @('west==1.5.0', 'reuse==6.2.0')
+    $indexCopy = Copy-OfflineRequirements $includedRequirements $Workspace (Join-Path $Root 'requirements-index') $indexFrozen $pinned
+    Assert ((Get-Content -LiteralPath $indexCopy) -eq 'reuse==6.2.0; sys_platform == "win32"') 'A pinned index installation could not replace the upstream archive requirement.'
+    Assert ((Get-Content -LiteralPath $includedRequirements) -eq $remoteLine) 'Index normalization edited the original requirements.'
+    Expect-Failure { Copy-OfflineRequirements $includedRequirements $Workspace (Join-Path $Root 'requirements-pin-mismatch') @('reuse==6.1.0') $pinned } '*does not match the installed source*'
+    Expect-Failure { Copy-OfflineRequirements $includedRequirements $Workspace (Join-Path $Root 'requirements-not-installed') @('west==1.5.0') $pinned } '*does not match the installed source*'
     foreach ($line in @('-e D:\local-package', 'reuse @ file:///D:/local-package', 'reuse @ git+https://example.invalid/reuse.git')) {
         Expect-Failure { ConvertTo-OfflineRequirements 'Invoke-FrozenPython' @($line) } '*local/editable or unsupported*'
     }
